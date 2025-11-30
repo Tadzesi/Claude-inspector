@@ -1,0 +1,14 @@
+# Generated report (users generate their own)
+claude-inspector-report.html
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+nul
