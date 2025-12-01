@@ -61,7 +61,7 @@ Claude Code Inspector is a PowerShell script that scans and reports on all Claud
 |---------|-------------|
 | Settings | Global and project settings.json files with content preview |
 | MCP Servers | Configured MCP servers from .mcp.json and settings |
-| Memory | CLAUDE.md files (global, project root, .claude folder, local) |
+| Memory | CLAUDE.md files (global, project root, project .claude/, project local) |
 | Agents | Custom agent definitions with YAML frontmatter parsing |
 | Commands | Custom slash commands |
 | Skills | Agent skills (SKILL.md files) with description and allowed tools |
@@ -143,6 +143,15 @@ Uses predefined rates per 1M tokens (2025 pricing):
 - Analytics cards with highlight colors for key metrics
 - Bar charts for tool and model usage distribution
 - Time-series chart for daily token usage (last 14 days)
+
+**Source badges:**
+- Blue `Global` badge for user-wide configurations (~/.claude/)
+- Green `Project` badge for project-specific configurations (.claude/)
+- Gold `Enterprise` badge for managed/IT-controlled settings (ProgramData)
+
+**JSON syntax highlighting:**
+- Professional code-style colors in expandable JSON blocks
+- Keys (blue), strings (orange), numbers (green), booleans/null (blue), brackets (purple)
 
 ## Implementation Details
 
