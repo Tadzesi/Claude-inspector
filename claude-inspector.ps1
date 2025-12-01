@@ -12,7 +12,7 @@ $globalPath = "$env:USERPROFILE\.claude"
 $reportPath = Join-Path $ProjectPath "claude-inspector-report.html"
 $projectName = Split-Path $ProjectPath -Leaf
 
-# Cost rates per 1M tokens (as of 2024 pricing)
+# Cost rates per 1M tokens (as of 2025 pricing)
 $script:CostRates = @{
     "claude-3-opus" = @{ Input = 15.00; Output = 75.00 }
     "claude-3-sonnet" = @{ Input = 3.00; Output = 15.00 }
@@ -20,7 +20,9 @@ $script:CostRates = @{
     "claude-3-5-sonnet" = @{ Input = 3.00; Output = 15.00 }
     "claude-3-5-haiku" = @{ Input = 0.80; Output = 4.00 }
     "claude-sonnet-4" = @{ Input = 3.00; Output = 15.00 }
+    "claude-sonnet-4-5" = @{ Input = 3.00; Output = 15.00 }
     "claude-opus-4" = @{ Input = 15.00; Output = 75.00 }
+    "claude-opus-4-5" = @{ Input = 15.00; Output = 75.00 }
     "default" = @{ Input = 3.00; Output = 15.00 }
 }
 
@@ -117,7 +119,23 @@ function Get-McpServersInfo {
             Exists = Test-Path "$ProjectPath\.mcp.json"
             Content = Get-JsonContent "$ProjectPath\.mcp.json"
         }
+        GlobalMcp = @{
+            Path = "$globalPath\.mcp.json"
+            Exists = Test-Path "$globalPath\.mcp.json"
+            Content = Get-JsonContent "$globalPath\.mcp.json"
+        }
         Servers = @()
+    }
+
+    # Get servers from global .mcp.json
+    if ($mcpInfo.GlobalMcp.Content -and $mcpInfo.GlobalMcp.Content.mcpServers) {
+        foreach ($server in $mcpInfo.GlobalMcp.Content.mcpServers.PSObject.Properties) {
+            $mcpInfo.Servers += @{
+                Name = $server.Name
+                Source = "Global (.mcp.json)"
+                Config = $server.Value
+            }
+        }
     }
 
     # Get servers from project .mcp.json
@@ -131,11 +149,22 @@ function Get-McpServersInfo {
         }
     }
 
-    # Get enabled/disabled from settings
+    # Get MCP servers from settings files (user scope)
     $allSettings = Get-SettingsInfo
     foreach ($settingType in @('Global', 'GlobalLocal', 'Project', 'ProjectLocal')) {
         $content = $allSettings[$settingType].Content
         if ($content) {
+            # Check for mcpServers in settings
+            if ($content.mcpServers) {
+                foreach ($server in $content.mcpServers.PSObject.Properties) {
+                    $mcpInfo.Servers += @{
+                        Name = $server.Name
+                        Source = "$settingType (settings.json)"
+                        Config = $server.Value
+                    }
+                }
+            }
+
             if ($content.enabledMcpjsonServers) {
                 $mcpInfo.EnabledServers = $content.enabledMcpjsonServers
             }
@@ -249,6 +278,201 @@ function Get-CommandsInfo {
     }
 
     return $commands
+}
+
+# Parse YAML frontmatter from markdown content
+function Get-YamlFrontmatter {
+    param([string]$Content)
+
+    $metadata = @{
+        Name = $null
+        Description = $null
+        Tools = @()
+        Model = $null
+        AllowedTools = @()
+        Skills = @()
+    }
+
+    if ($null -eq $Content) { return $metadata }
+
+    # Check for YAML frontmatter (starts with ---)
+    if ($Content -match '(?s)^---\s*\r?\n(.+?)\r?\n---') {
+        $yaml = $matches[1]
+
+        # Parse name
+        if ($yaml -match '(?m)^name:\s*(.+)$') {
+            $metadata.Name = $matches[1].Trim().Trim('"', "'")
+        }
+
+        # Parse description
+        if ($yaml -match '(?m)^description:\s*(.+)$') {
+            $metadata.Description = $matches[1].Trim().Trim('"', "'")
+        }
+
+        # Parse model
+        if ($yaml -match '(?m)^model:\s*(.+)$') {
+            $metadata.Model = $matches[1].Trim().Trim('"', "'")
+        }
+
+        # Parse tools (comma-separated or array)
+        if ($yaml -match '(?m)^tools:\s*\[([^\]]+)\]') {
+            $metadata.Tools = $matches[1] -split ',' | ForEach-Object { $_.Trim().Trim('"', "'") }
+        } elseif ($yaml -match '(?m)^tools:\s*(.+)$') {
+            $metadata.Tools = $matches[1] -split ',' | ForEach-Object { $_.Trim().Trim('"', "'") }
+        }
+
+        # Parse allowed-tools (for skills)
+        if ($yaml -match '(?m)^allowed-tools:\s*\[([^\]]+)\]') {
+            $metadata.AllowedTools = $matches[1] -split ',' | ForEach-Object { $_.Trim().Trim('"', "'") }
+        } elseif ($yaml -match '(?s)allowed-tools:\s*\r?\n((?:\s*-\s*.+\r?\n?)+)') {
+            $metadata.AllowedTools = $matches[1] -split '\r?\n' | Where-Object { $_ -match '^\s*-\s*(.+)$' } | ForEach-Object {
+                if ($_ -match '^\s*-\s*(.+)$') { $matches[1].Trim() }
+            }
+        }
+
+        # Parse skills
+        if ($yaml -match '(?m)^skills:\s*(.+)$') {
+            $metadata.Skills = $matches[1] -split ',' | ForEach-Object { $_.Trim().Trim('"', "'") }
+        }
+    }
+
+    return $metadata
+}
+
+# Collect Skills Information
+function Get-SkillsInfo {
+    $skills = @{
+        Global = @{
+            Path = "$globalPath\skills"
+            Exists = Test-Path "$globalPath\skills"
+            Items = @()
+        }
+        Project = @{
+            Path = "$ProjectPath\.claude\skills"
+            Exists = Test-Path "$ProjectPath\.claude\skills"
+            Items = @()
+        }
+    }
+
+    # Scan global skills
+    if ($skills.Global.Exists) {
+        $skillFolders = Get-ChildItem "$globalPath\skills" -Directory -ErrorAction SilentlyContinue
+        foreach ($folder in $skillFolders) {
+            $skillFile = Join-Path $folder.FullName "SKILL.md"
+            if (Test-Path $skillFile) {
+                $content = Get-Content $skillFile -Raw -ErrorAction SilentlyContinue
+                $metadata = Get-YamlFrontmatter $content
+                $skills.Global.Items += @{
+                    Name = if ($metadata.Name) { $metadata.Name } else { $folder.Name }
+                    FolderName = $folder.Name
+                    Path = $skillFile
+                    Description = $metadata.Description
+                    AllowedTools = $metadata.AllowedTools
+                    Content = $content
+                }
+            }
+        }
+    }
+
+    # Scan project skills
+    if ($skills.Project.Exists) {
+        $skillFolders = Get-ChildItem "$ProjectPath\.claude\skills" -Directory -ErrorAction SilentlyContinue
+        foreach ($folder in $skillFolders) {
+            $skillFile = Join-Path $folder.FullName "SKILL.md"
+            if (Test-Path $skillFile) {
+                $content = Get-Content $skillFile -Raw -ErrorAction SilentlyContinue
+                $metadata = Get-YamlFrontmatter $content
+                $skills.Project.Items += @{
+                    Name = if ($metadata.Name) { $metadata.Name } else { $folder.Name }
+                    FolderName = $folder.Name
+                    Path = $skillFile
+                    Description = $metadata.Description
+                    AllowedTools = $metadata.AllowedTools
+                    Content = $content
+                }
+            }
+        }
+    }
+
+    return $skills
+}
+
+# Collect Plugins Information
+function Get-PluginsInfo {
+    $plugins = @{
+        Configured = @()
+        Marketplaces = @()
+    }
+
+    # Check settings for plugin configuration
+    $allSettings = Get-SettingsInfo
+    foreach ($settingType in @('Global', 'GlobalLocal', 'Project', 'ProjectLocal')) {
+        $content = $allSettings[$settingType].Content
+        if ($content) {
+            # Check for enabled/disabled plugins
+            if ($content.plugins) {
+                if ($content.plugins.enabled) {
+                    foreach ($p in $content.plugins.enabled) {
+                        $plugins.Configured += @{
+                            Name = $p
+                            Status = "Enabled"
+                            Source = $settingType
+                        }
+                    }
+                }
+                if ($content.plugins.disabled) {
+                    foreach ($p in $content.plugins.disabled) {
+                        $plugins.Configured += @{
+                            Name = $p
+                            Status = "Disabled"
+                            Source = $settingType
+                        }
+                    }
+                }
+            }
+
+            # Check for marketplace configurations
+            if ($content.extraKnownMarketplaces) {
+                foreach ($market in $content.extraKnownMarketplaces.PSObject.Properties) {
+                    $plugins.Marketplaces += @{
+                        Name = $market.Name
+                        Config = $market.Value
+                        Source = $settingType
+                    }
+                }
+            }
+        }
+    }
+
+    return $plugins
+}
+
+# Collect Enterprise/Managed Settings
+function Get-ManagedSettingsInfo {
+    # Windows enterprise paths
+    $managedPath = "C:\ProgramData\ClaudeCode"
+
+    $managed = @{
+        Path = $managedPath
+        Exists = Test-Path $managedPath
+        Settings = @{
+            Path = "$managedPath\managed-settings.json"
+            Exists = Test-Path "$managedPath\managed-settings.json"
+            Content = Get-JsonContent "$managedPath\managed-settings.json"
+        }
+        Mcp = @{
+            Path = "$managedPath\managed-mcp.json"
+            Exists = Test-Path "$managedPath\managed-mcp.json"
+            Content = Get-JsonContent "$managedPath\managed-mcp.json"
+        }
+        Memory = @{
+            Path = "$managedPath\CLAUDE.md"
+            Exists = Test-Path "$managedPath\CLAUDE.md"
+            Content = Get-FileContentSafe "$managedPath\CLAUDE.md"
+        }
+    }
+
+    return $managed
 }
 
 # Collect Hooks Information
@@ -472,9 +696,11 @@ function Get-GlobalAnalytics {
         # Merge model usage
         foreach ($model in $sessionStats.ModelUsage.Keys) {
             if (-not $analytics.ModelUsage.ContainsKey($model)) {
-                $analytics.ModelUsage[$model] = @{ Calls = 0 }
+                $analytics.ModelUsage[$model] = @{ Calls = 0; InputTokens = 0; OutputTokens = 0 }
             }
             $analytics.ModelUsage[$model].Calls += $sessionStats.ModelUsage[$model].Calls
+            $analytics.ModelUsage[$model].InputTokens += $sessionStats.ModelUsage[$model].InputTokens
+            $analytics.ModelUsage[$model].OutputTokens += $sessionStats.ModelUsage[$model].OutputTokens
         }
 
         # Merge tool usage
@@ -553,6 +779,7 @@ function Get-SessionStats {
         $sessionErrors = @()
         $sessionMessages = @()
         $isCorrupted = $false
+        $lastSeenModel = $null  # Track last model for token attribution
         $lineCount = 0
 
         try {
@@ -568,21 +795,48 @@ function Get-SessionStats {
                     continue
                 }
 
-                # Extract tokens from usage object
-                if ($line -match '"input_tokens"\s*:\s*(\d+)') {
-                    $sessionInput += [int]$matches[1]
-                }
-                if ($line -match '"output_tokens"\s*:\s*(\d+)') {
-                    $sessionOutput += [int]$matches[1]
+                # Extract model information and track it for token attribution
+                if ($line -match '"model"\s*:\s*"([^"]+)"') {
+                    $lastSeenModel = $matches[1]
+                    if (-not $sessionModels.ContainsKey($lastSeenModel)) {
+                        $sessionModels[$lastSeenModel] = @{ InputTokens = 0; OutputTokens = 0; Calls = 0 }
+                    }
+                    $sessionModels[$lastSeenModel].Calls++
                 }
 
-                # Extract model information
-                if ($line -match '"model"\s*:\s*"([^"]+)"') {
-                    $model = $matches[1]
-                    if (-not $sessionModels.ContainsKey($model)) {
-                        $sessionModels[$model] = @{ InputTokens = 0; OutputTokens = 0; Calls = 0 }
-                    }
-                    $sessionModels[$model].Calls++
+                # Extract tokens from usage object (including cache tokens)
+                $lineInputTokens = 0
+                $lineOutputTokens = 0
+
+                # Standard input_tokens
+                if ($line -match '"input_tokens"\s*:\s*(\d+)') {
+                    $lineInputTokens += [int]$matches[1]
+                }
+                # Cache creation input tokens (counts as input)
+                if ($line -match '"cache_creation_input_tokens"\s*:\s*(\d+)') {
+                    $lineInputTokens += [int]$matches[1]
+                }
+                # Cache read input tokens (counts as input)
+                if ($line -match '"cache_read_input_tokens"\s*:\s*(\d+)') {
+                    $lineInputTokens += [int]$matches[1]
+                }
+                # Output tokens
+                if ($line -match '"output_tokens"\s*:\s*(\d+)') {
+                    $lineOutputTokens = [int]$matches[1]
+                }
+
+                # Add to session totals
+                if ($lineInputTokens -gt 0) {
+                    $sessionInput += $lineInputTokens
+                }
+                if ($lineOutputTokens -gt 0) {
+                    $sessionOutput += $lineOutputTokens
+                }
+
+                # Attribute tokens to model (model and tokens are on same line in JSONL)
+                if ($lastSeenModel -and ($lineInputTokens -gt 0 -or $lineOutputTokens -gt 0)) {
+                    $sessionModels[$lastSeenModel].InputTokens += $lineInputTokens
+                    $sessionModels[$lastSeenModel].OutputTokens += $lineOutputTokens
                 }
 
                 # Extract tool usage
@@ -710,6 +964,8 @@ function Get-SessionStats {
                 $stats.ModelUsage[$model] = @{ InputTokens = 0; OutputTokens = 0; Calls = 0 }
             }
             $stats.ModelUsage[$model].Calls += $sessionModels[$model].Calls
+            $stats.ModelUsage[$model].InputTokens += $sessionModels[$model].InputTokens
+            $stats.ModelUsage[$model].OutputTokens += $sessionModels[$model].OutputTokens
         }
 
         # Merge tool usage
@@ -1032,12 +1288,18 @@ function New-HtmlReport {
     $agents = Get-AgentsInfo
     Write-Host "  Collecting commands..." -ForegroundColor Gray
     $commands = Get-CommandsInfo
+    Write-Host "  Collecting skills..." -ForegroundColor Gray
+    $skills = Get-SkillsInfo
+    Write-Host "  Collecting plugins..." -ForegroundColor Gray
+    $plugins = Get-PluginsInfo
     Write-Host "  Collecting hooks..." -ForegroundColor Gray
     $hooks = Get-HooksInfo
     Write-Host "  Collecting permissions..." -ForegroundColor Gray
     $permissions = Get-ToolPermissions
     Write-Host "  Detecting permission conflicts..." -ForegroundColor Gray
     $permConflicts = Get-PermissionConflicts
+    Write-Host "  Checking enterprise settings..." -ForegroundColor Gray
+    $managed = Get-ManagedSettingsInfo
     Write-Host "  Analyzing all projects (this may take a moment)..." -ForegroundColor Gray
     $projects = Get-ProjectsInfo
     Write-Host "  Computing global analytics..." -ForegroundColor Gray
@@ -1050,12 +1312,15 @@ function New-HtmlReport {
     # Count items for menu badges
     $settingsCount = @($settings.Global, $settings.GlobalLocal, $settings.Project, $settings.ProjectLocal | Where-Object { $_.Exists }).Count
     $mcpCount = $mcp.Servers.Count
-    $memoryCount = @($memory.Global, $memory.ProjectRoot, $memory.ProjectFolder | Where-Object { $_.Exists }).Count
+    $memoryCount = @($memory.Global, $memory.ProjectRoot, $memory.ProjectFolder, $memory.ProjectLocal | Where-Object { $_.Exists }).Count
     $agentsCount = $agents.Global.Files.Count + $agents.Project.Files.Count
     $commandsCount = $commands.Global.Files.Count + $commands.Project.Files.Count
+    $skillsCount = $skills.Global.Items.Count + $skills.Project.Items.Count
+    $pluginsCount = $plugins.Configured.Count + $plugins.Marketplaces.Count
     $hooksCount = $hooks.FromSettings.Count + $hooks.ProjectFolder.Files.Count
     $permissionsCount = $permissions.Allow.Count + $permissions.Deny.Count + $permissions.Ask.Count
     $conflictsCount = $permConflicts.Count
+    $managedCount = @($managed.Settings, $managed.Mcp, $managed.Memory | Where-Object { $_.Exists }).Count
     $recommendationsCount = $recommendations.Count
     $projectsCount = $projects.Count
     $errorsCount = $analytics.Errors.Count
@@ -1267,6 +1532,37 @@ function New-HtmlReport {
         }
         .section-title .count { color: #666; font-weight: normal; }
 
+        .subsection-title {
+            color: #888;
+            font-size: 13px;
+            margin: 20px 0 10px 0;
+            padding-bottom: 6px;
+            border-bottom: 1px solid #2a2a2a;
+        }
+
+        .section-description {
+            color: #888;
+            font-size: 12px;
+            margin: -10px 0 20px 0;
+            padding: 12px 15px;
+            background: rgba(255, 255, 255, 0.02);
+            border-left: 3px solid #333;
+            border-radius: 0 4px 4px 0;
+        }
+        .section-description a {
+            color: #4da6ff;
+            text-decoration: none;
+        }
+        .section-description a:hover {
+            text-decoration: underline;
+        }
+        .section-description code {
+            background: #252525;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+        }
+
         /* Terminal Output Style */
         .output-line {
             padding: 6px 0;
@@ -1392,6 +1688,53 @@ function New-HtmlReport {
         .item-row:hover { background: #1a1a1a; margin: 0 -10px; padding: 8px 10px; }
         .item-row .name { color: #9cdcfe; }
         .item-row .source { color: #555; font-size: 11px; }
+        .item-row .source.badge-global,
+        .output-block-header .source.badge-global {
+            background: rgba(78, 154, 241, 0.15);
+            color: #4e9af1;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+        }
+        .item-row .source.badge-project,
+        .output-block-header .source.badge-project {
+            background: rgba(126, 200, 80, 0.15);
+            color: #7ec850;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+        }
+        .item-row .source.badge-enterprise,
+        .output-block-header .source.badge-enterprise {
+            background: rgba(220, 170, 80, 0.15);
+            color: #dcaa50;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+        }
+        .item-row .status { font-size: 11px; }
+        .item-row .status.ok { color: #7ec850; }
+        .item-row .status.warn { color: #dcdcaa; }
+
+        /* JSON Syntax Highlighting */
+        .json-view {
+            background: #0c0c0c;
+            border: 1px solid #252525;
+            border-radius: 4px;
+            padding: 12px;
+            overflow-x: auto;
+            font-family: 'Cascadia Code', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+        .json-key { color: #9cdcfe; }
+        .json-string { color: #ce9178; }
+        .json-number { color: #b5cea8; }
+        .json-boolean { color: #569cd6; }
+        .json-null { color: #569cd6; }
+        .json-bracket { color: #da70d6; }
+        .json-colon { color: #cccccc; }
+        .json-comma { color: #cccccc; }
 
         /* Project Rows */
         .project-row {
@@ -1509,13 +1852,13 @@ function New-HtmlReport {
         .chart-title { color: #888; font-size: 12px; margin-bottom: 15px; text-transform: uppercase; }
         .bar-chart { display: flex; flex-direction: column; gap: 8px; }
         .bar-row { display: flex; align-items: center; gap: 10px; }
-        .bar-label { color: #888; font-size: 11px; min-width: 100px; text-align: right; }
-        .bar-track { flex: 1; height: 20px; background: #252525; position: relative; }
+        .bar-label { color: #888; font-size: 11px; min-width: 180px; max-width: 180px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .bar-track { flex: 1; height: 20px; background: #252525; position: relative; min-width: 100px; }
         .bar-fill { height: 100%; background: #0078d4; transition: width 0.3s; }
         .bar-fill.green { background: #7ec850; }
         .bar-fill.yellow { background: #dcdcaa; }
         .bar-fill.red { background: #f14c4c; }
-        .bar-value { color: #666; font-size: 11px; min-width: 60px; }
+        .bar-value { color: #666; font-size: 11px; min-width: 80px; text-align: right; }
 
         /* Usage Chart (Time-based) */
         .usage-chart { height: 150px; display: flex; align-items: flex-end; gap: 2px; padding-top: 20px; }
@@ -1565,6 +1908,45 @@ function New-HtmlReport {
         }
         .tool-item .tool-name { color: #9cdcfe; font-size: 12px; }
         .tool-item .tool-count { color: #dcdcaa; font-size: 14px; font-weight: 500; }
+
+        /* Model Token Usage Grid */
+        .model-tokens-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .model-token-item {
+            background: #1a1a1a;
+            padding: 10px 12px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border: 1px solid #252525;
+        }
+        .model-token-item .model-name {
+            color: #9cdcfe;
+            font-size: 11px;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .model-token-item .token-in {
+            color: #7ec850;
+            font-size: 11px;
+            min-width: 70px;
+        }
+        .model-token-item .token-out {
+            color: #dcdcaa;
+            font-size: 11px;
+            min-width: 70px;
+        }
+        .model-token-item .token-calls {
+            color: #666;
+            font-size: 10px;
+            min-width: 60px;
+        }
 
         /* Maintenance Items */
         .maint-item {
@@ -1666,7 +2048,7 @@ function New-HtmlReport {
             </li>
             <li class="menu-item $(if($memoryCount -gt 0){'has-items'})" data-section="memory">
                 <span class="label"><span class="prefix">&gt;</span> Memory</span>
-                <span class="badge">$memoryCount/3</span>
+                <span class="badge">$memoryCount/4</span>
             </li>
             <li class="menu-item $(if($agentsCount -gt 0){'has-items'})" data-section="agents">
                 <span class="label"><span class="prefix">&gt;</span> Agents</span>
@@ -1676,6 +2058,14 @@ function New-HtmlReport {
                 <span class="label"><span class="prefix">&gt;</span> Commands</span>
                 <span class="badge">$commandsCount</span>
             </li>
+            <li class="menu-item $(if($skillsCount -gt 0){'has-items'})" data-section="skills">
+                <span class="label"><span class="prefix">&gt;</span> Skills</span>
+                <span class="badge">$skillsCount</span>
+            </li>
+            <li class="menu-item $(if($pluginsCount -gt 0){'has-items'})" data-section="plugins">
+                <span class="label"><span class="prefix">&gt;</span> Plugins</span>
+                <span class="badge">$pluginsCount</span>
+            </li>
             <li class="menu-item $(if($hooksCount -gt 0){'has-items'})" data-section="hooks">
                 <span class="label"><span class="prefix">&gt;</span> Hooks</span>
                 <span class="badge">$hooksCount</span>
@@ -1683,6 +2073,10 @@ function New-HtmlReport {
             <li class="menu-item $(if($permissionsCount -gt 0){'has-items'})" data-section="permissions">
                 <span class="label"><span class="prefix">&gt;</span> Permissions</span>
                 <span class="badge">$permissionsCount</span>
+            </li>
+            <li class="menu-item $(if($managedCount -gt 0){'has-items'})" data-section="enterprise">
+                <span class="label"><span class="prefix">&gt;</span> Enterprise</span>
+                <span class="badge">$managedCount/3</span>
             </li>
             <li class="menu-divider"></li>
             <li class="menu-section-title">Usage Data</li>
@@ -1796,6 +2190,68 @@ function New-HtmlReport {
                         <span>$($chartData[-1].Date)</span>
                     </div>
                 </div>
+"@
+
+    # Generate Token Usage per Model chart
+    if ($analytics.ModelUsage.Keys.Count -gt 0) {
+        $sortedModelsByTokens = $analytics.ModelUsage.GetEnumerator() |
+            ForEach-Object { @{ Name = $_.Key; Total = $_.Value.InputTokens + $_.Value.OutputTokens; Input = $_.Value.InputTokens; Output = $_.Value.OutputTokens; Calls = $_.Value.Calls } } |
+            Sort-Object { $_.Total } -Descending
+        $maxModelTokens = ($sortedModelsByTokens | Select-Object -First 1).Total
+        if ($maxModelTokens -eq 0) { $maxModelTokens = 1 }
+
+        $html += @"
+                <div class="chart-container">
+                    <div class="chart-title">Token Usage by Model</div>
+                    <div class="bar-chart">
+"@
+        foreach ($modelData in $sortedModelsByTokens) {
+            $modelName = ConvertTo-HtmlEncoded $modelData.Name
+            $totalTokens = $modelData.Total
+            $inputTokens = $modelData.Input
+            $outputTokens = $modelData.Output
+            $widthPct = [Math]::Round(($totalTokens / $maxModelTokens) * 100)
+
+            # Format token display
+            $totalDisplay = if ($totalTokens -ge 1000000) { "{0:N1}M" -f ($totalTokens / 1000000) } elseif ($totalTokens -ge 1000) { "{0:N0}K" -f ($totalTokens / 1000) } else { "$totalTokens" }
+            $inputDisplay = if ($inputTokens -ge 1000000) { "{0:N1}M" -f ($inputTokens / 1000000) } elseif ($inputTokens -ge 1000) { "{0:N0}K" -f ($inputTokens / 1000) } else { "$inputTokens" }
+            $outputDisplay = if ($outputTokens -ge 1000000) { "{0:N1}M" -f ($outputTokens / 1000000) } elseif ($outputTokens -ge 1000) { "{0:N0}K" -f ($outputTokens / 1000) } else { "$outputTokens" }
+
+            # Color based on model type
+            $barClass = if ($modelName -match "opus") { "yellow" } elseif ($modelName -match "haiku") { "green" } else { "" }
+
+            $html += @"
+                        <div class="bar-row">
+                            <span class="bar-label" title="$modelName">$modelName</span>
+                            <div class="bar-track"><div class="bar-fill $barClass" style="width: ${widthPct}%"></div></div>
+                            <span class="bar-value">$totalDisplay</span>
+                        </div>
+"@
+        }
+        $html += @"
+                    </div>
+                </div>
+                <div class="model-tokens-grid">
+"@
+        foreach ($modelData in $sortedModelsByTokens) {
+            $modelName = ConvertTo-HtmlEncoded $modelData.Name
+            $inputTokens = $modelData.Input
+            $outputTokens = $modelData.Output
+            $inputDisplay = if ($inputTokens -ge 1000000) { "{0:N1}M" -f ($inputTokens / 1000000) } elseif ($inputTokens -ge 1000) { "{0:N0}K" -f ($inputTokens / 1000) } else { "$inputTokens" }
+            $outputDisplay = if ($outputTokens -ge 1000000) { "{0:N1}M" -f ($outputTokens / 1000000) } elseif ($outputTokens -ge 1000) { "{0:N0}K" -f ($outputTokens / 1000) } else { "$outputTokens" }
+
+            $html += @"
+                    <div class="model-token-item">
+                        <span class="model-name" title="$modelName">$modelName</span>
+                        <span class="token-in">In: $inputDisplay</span>
+                        <span class="token-out">Out: $outputDisplay</span>
+                    </div>
+"@
+        }
+        $html += "                </div>`n"
+    }
+
+    $html += @"
             </div>
 
             <!-- Projects Section -->
@@ -1943,6 +2399,10 @@ function New-HtmlReport {
             <!-- Settings Section -->
             <div id="settings" class="section">
                 <h2 class="section-title">Settings <span class="count">($settingsCount configured)</span></h2>
+                <div class="section-description">
+                    Configure Claude Code behavior via JSON files. <strong>Global</strong> settings apply to all projects, <strong>Project</strong> settings override for specific projects. Files ending in <code>.local.json</code> are machine-specific and git-ignored.
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/settings" target="_blank">View Settings Documentation &rarr;</a>
+                </div>
                 <div class="output-line">
                     <span class="key">Global</span>
                     <span class="value $(if($settings.Global.Exists){'ok'}else{'missing'})">$(if($settings.Global.Exists){'[OK] ' + $settings.Global.Path}else{'[--] Not configured'})</span>
@@ -1965,13 +2425,15 @@ function New-HtmlReport {
     foreach ($type in @('Global', 'GlobalLocal', 'Project', 'ProjectLocal')) {
         if ($settings[$type].Exists -and $settings[$type].Content) {
             $jsonContent = ConvertTo-HtmlEncoded ($settings[$type].Content | ConvertTo-Json -Depth 10)
+            $badgeClass = if ($type -like 'Global*') { 'badge-global' } else { 'badge-project' }
+            $badgeText = if ($type -like 'Global*') { 'Global' } else { 'Project' }
             $html += @"
                 <div class="output-block">
                     <div class="output-block-header" onclick="this.parentElement.classList.toggle('open')">
-                        <span>$type settings content</span>
-                        <span class="toggle"></span>
+                        <span>[+] $type settings</span>
+                        <span class="source $badgeClass">$badgeText</span>
                     </div>
-                    <div class="output-block-content"><pre>$jsonContent</pre></div>
+                    <div class="output-block-content"><pre class="json-view">$jsonContent</pre></div>
                 </div>
 "@
         }
@@ -1983,16 +2445,23 @@ function New-HtmlReport {
             <!-- MCP Section -->
             <div id="mcp" class="section">
                 <h2 class="section-title">MCP Servers <span class="count">($mcpCount configured)</span></h2>
+                <div class="section-description">
+                    Model Context Protocol (MCP) servers extend Claude's capabilities with external tools and data sources. Configure in <code>.mcp.json</code> (project-scoped, shared via git) or <code>settings.json</code> (user-scoped).
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/mcp" target="_blank">View MCP Documentation &rarr;</a>
+                </div>
 "@
 
     if ($mcp.Servers.Count -gt 0) {
         foreach ($server in $mcp.Servers) {
             $serverName = ConvertTo-HtmlEncoded $server.Name
-            $serverSource = ConvertTo-HtmlEncoded $server.Source
+            $serverSource = $server.Source
+            # Determine badge class based on source
+            $badgeClass = if ($serverSource -match 'Global|settings\.json') { 'badge-global' } else { 'badge-project' }
+            $badgeText = if ($serverSource -match 'Global|settings\.json') { 'Global' } else { 'Project' }
             $html += @"
                 <div class="item-row">
                     <span class="name">$serverName</span>
-                    <span class="source">$serverSource</span>
+                    <span class="source $badgeClass">$badgeText</span>
                 </div>
 "@
         }
@@ -2001,10 +2470,10 @@ function New-HtmlReport {
             $html += @"
                 <div class="output-block">
                     <div class="output-block-header" onclick="this.parentElement.classList.toggle('open')">
-                        <span>.mcp.json content</span>
-                        <span class="toggle"></span>
+                        <span>[+] .mcp.json content</span>
+                        <span class="source badge-project">Project</span>
                     </div>
-                    <div class="output-block-content"><pre>$mcpContent</pre></div>
+                    <div class="output-block-content"><pre class="json-view">$mcpContent</pre></div>
                 </div>
 "@
         }
@@ -2023,6 +2492,10 @@ function New-HtmlReport {
             <!-- Memory Section -->
             <div id="memory" class="section">
                 <h2 class="section-title">Memory (CLAUDE.md) <span class="count">($memoryCount configured)</span></h2>
+                <div class="section-description">
+                    CLAUDE.md files provide persistent context and instructions. <strong>Global</strong> (~/.claude/) applies everywhere, <strong>Project</strong> files are shared with your team via git. Use <code>CLAUDE.local.md</code> for personal notes (git-ignored).
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/memory" target="_blank">View Memory Documentation &rarr;</a>
+                </div>
                 <div class="output-line">
                     <span class="key">Global</span>
                     <span class="value $(if($memory.Global.Exists){'ok'}else{'missing'})">$(if($memory.Global.Exists){'[OK] ' + $memory.Global.Path}else{'[--] Not configured'})</span>
@@ -2034,6 +2507,10 @@ function New-HtmlReport {
                 <div class="output-line">
                     <span class="key">Project .claude/</span>
                     <span class="value $(if($memory.ProjectFolder.Exists){'ok'}else{'missing'})">$(if($memory.ProjectFolder.Exists){'[OK] ' + $memory.ProjectFolder.Path}else{'[--] Not configured'})</span>
+                </div>
+                <div class="output-line">
+                    <span class="key">Project Local</span>
+                    <span class="value $(if($memory.ProjectLocal.Exists){'ok'}else{'missing'})">$(if($memory.ProjectLocal.Exists){'[OK] ' + $memory.ProjectLocal.Path}else{'[--] Not configured'})</span>
                 </div>
 "@
 
@@ -2058,6 +2535,10 @@ function New-HtmlReport {
             <!-- Agents Section -->
             <div id="agents" class="section">
                 <h2 class="section-title">Custom Agents <span class="count">($agentsCount configured)</span></h2>
+                <div class="section-description">
+                    Subagents are specialized AI assistants for specific tasks. <strong>Global</strong> agents (~/.claude/agents/) work across all projects, <strong>Project</strong> agents (.claude/agents/) are team-shared. Define with markdown files containing YAML frontmatter.
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/sub-agents" target="_blank">View Subagents Documentation &rarr;</a>
+                </div>
 "@
 
     if ($agentsCount -gt 0) {
@@ -2066,7 +2547,7 @@ function New-HtmlReport {
             $html += @"
                 <div class="item-row">
                     <span class="name">$agentName</span>
-                    <span class="source">Global</span>
+                    <span class="source badge-global">Global</span>
                 </div>
 "@
         }
@@ -2075,7 +2556,7 @@ function New-HtmlReport {
             $html += @"
                 <div class="item-row">
                     <span class="name">$agentName</span>
-                    <span class="source">Project</span>
+                    <span class="source badge-project">Project</span>
                 </div>
 "@
         }
@@ -2094,6 +2575,10 @@ function New-HtmlReport {
             <!-- Commands Section -->
             <div id="commands" class="section">
                 <h2 class="section-title">Custom Commands <span class="count">($commandsCount configured)</span></h2>
+                <div class="section-description">
+                    Slash commands are reusable prompts invoked with <code>/command-name</code>. <strong>Global</strong> commands (~/.claude/commands/) work everywhere, <strong>Project</strong> commands (.claude/commands/) are team-shared via git.
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/slash-commands" target="_blank">View Slash Commands Documentation &rarr;</a>
+                </div>
 "@
 
     if ($commandsCount -gt 0) {
@@ -2102,7 +2587,7 @@ function New-HtmlReport {
             $html += @"
                 <div class="item-row">
                     <span class="name">$cmdName</span>
-                    <span class="source">Global</span>
+                    <span class="source badge-global">Global</span>
                 </div>
 "@
         }
@@ -2111,7 +2596,7 @@ function New-HtmlReport {
             $html += @"
                 <div class="item-row">
                     <span class="name">$cmdName</span>
-                    <span class="source">Project</span>
+                    <span class="source badge-project">Project</span>
                 </div>
 "@
         }
@@ -2127,18 +2612,140 @@ function New-HtmlReport {
     $html += @"
             </div>
 
+            <!-- Skills Section -->
+            <div id="skills" class="section">
+                <h2 class="section-title">Agent Skills <span class="count">($skillsCount configured)</span></h2>
+                <div class="section-description">
+                    Skills package expertise that Claude autonomously activates when relevant (unlike commands that require explicit invocation). <strong>Global</strong> skills (~/.claude/skills/) work everywhere, <strong>Project</strong> skills (.claude/skills/) are team-shared.
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/skills" target="_blank">View Skills Documentation &rarr;</a>
+                </div>
+"@
+
+    if ($skillsCount -gt 0) {
+        foreach ($skill in $skills.Global.Items) {
+            $skillName = ConvertTo-HtmlEncoded $skill.Name
+            $skillDesc = if ($skill.Description) { ConvertTo-HtmlEncoded $skill.Description } else { "<em>No description</em>" }
+            $skillTools = if ($skill.AllowedTools.Count -gt 0) { ($skill.AllowedTools -join ", ") } else { "All tools" }
+            $html += @"
+                <div class="output-block">
+                    <div class="output-block-header" onclick="this.parentElement.classList.toggle('open')">
+                        <span>[+] $skillName</span>
+                        <span class="source badge-global">Global</span>
+                    </div>
+                    <div class="output-block-content">
+                        <div class="output-line"><span class="key">Description</span><span class="value">$skillDesc</span></div>
+                        <div class="output-line"><span class="key">Allowed Tools</span><span class="value">$skillTools</span></div>
+                        <div class="output-line"><span class="key">Path</span><span class="value">$(ConvertTo-HtmlEncoded $skill.Path)</span></div>
+                    </div>
+                </div>
+"@
+        }
+        foreach ($skill in $skills.Project.Items) {
+            $skillName = ConvertTo-HtmlEncoded $skill.Name
+            $skillDesc = if ($skill.Description) { ConvertTo-HtmlEncoded $skill.Description } else { "<em>No description</em>" }
+            $skillTools = if ($skill.AllowedTools.Count -gt 0) { ($skill.AllowedTools -join ", ") } else { "All tools" }
+            $html += @"
+                <div class="output-block">
+                    <div class="output-block-header" onclick="this.parentElement.classList.toggle('open')">
+                        <span>[+] $skillName</span>
+                        <span class="source badge-project">Project</span>
+                    </div>
+                    <div class="output-block-content">
+                        <div class="output-line"><span class="key">Description</span><span class="value">$skillDesc</span></div>
+                        <div class="output-line"><span class="key">Allowed Tools</span><span class="value">$skillTools</span></div>
+                        <div class="output-line"><span class="key">Path</span><span class="value">$(ConvertTo-HtmlEncoded $skill.Path)</span></div>
+                    </div>
+                </div>
+"@
+        }
+    } else {
+        $html += @"
+                <div class="empty-state">
+                    <div>No skills configured</div>
+                    <div class="prompt">Create folders with SKILL.md in ~/.claude/skills/ or .claude/skills/</div>
+                </div>
+"@
+    }
+
+    $html += @"
+            </div>
+
+            <!-- Plugins Section -->
+            <div id="plugins" class="section">
+                <h2 class="section-title">Plugins <span class="count">($pluginsCount configured)</span></h2>
+                <div class="section-description">
+                    Plugins bundle commands, agents, skills, and hooks into shareable packages. Install from marketplaces or create custom plugins. Configure in <code>settings.json</code> with enabled/disabled lists.
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/plugins" target="_blank">View Plugins Documentation &rarr;</a>
+                </div>
+"@
+
+    if ($plugins.Configured.Count -gt 0) {
+        $html += @"
+                <h3 class="subsection-title">Configured Plugins</h3>
+"@
+        foreach ($plugin in $plugins.Configured) {
+            $pluginName = ConvertTo-HtmlEncoded $plugin.Name
+            $pluginStatus = $plugin.Status
+            $statusClass = if ($plugin.Status -eq "Enabled") { "ok" } else { "warn" }
+            $badgeClass = if ($plugin.Source -match 'Global') { 'badge-global' } else { 'badge-project' }
+            $badgeText = if ($plugin.Source -match 'Global') { 'Global' } else { 'Project' }
+            $html += @"
+                <div class="item-row">
+                    <span class="name">$pluginName</span>
+                    <span class="status $statusClass">$pluginStatus</span>
+                    <span class="source $badgeClass">$badgeText</span>
+                </div>
+"@
+        }
+    }
+
+    if ($plugins.Marketplaces.Count -gt 0) {
+        $html += @"
+                <h3 class="subsection-title">Plugin Marketplaces</h3>
+"@
+        foreach ($market in $plugins.Marketplaces) {
+            $marketName = ConvertTo-HtmlEncoded $market.Name
+            $badgeClass = if ($market.Source -match 'Global') { 'badge-global' } else { 'badge-project' }
+            $badgeText = if ($market.Source -match 'Global') { 'Global' } else { 'Project' }
+            $html += @"
+                <div class="item-row">
+                    <span class="name">$marketName</span>
+                    <span class="source $badgeClass">$badgeText</span>
+                </div>
+"@
+        }
+    }
+
+    if ($pluginsCount -eq 0) {
+        $html += @"
+                <div class="empty-state">
+                    <div>No plugins configured</div>
+                    <div class="prompt">Configure plugins in settings.json with the plugins key</div>
+                </div>
+"@
+    }
+
+    $html += @"
+            </div>
+
             <!-- Hooks Section -->
             <div id="hooks" class="section">
                 <h2 class="section-title">Hooks <span class="count">($hooksCount configured)</span></h2>
+                <div class="section-description">
+                    Hooks execute shell commands at lifecycle events (before/after tool calls, notifications, etc.). Define in <code>settings.json</code> under the <code>hooks</code> key. Useful for logging, validation, or custom integrations.
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/hooks" target="_blank">View Hooks Documentation &rarr;</a>
+                </div>
 "@
 
     if ($hooksCount -gt 0) {
         foreach ($hookSet in $hooks.FromSettings) {
-            $hookSource = ConvertTo-HtmlEncoded $hookSet.Source
+            $hookSource = $hookSet.Source
+            $badgeClass = if ($hookSource -match 'Global') { 'badge-global' } else { 'badge-project' }
+            $badgeText = if ($hookSource -match 'Global') { 'Global' } else { 'Project' }
             $html += @"
                 <div class="item-row">
                     <span class="name">Hooks defined in settings</span>
-                    <span class="source">$hookSource</span>
+                    <span class="source $badgeClass">$badgeText</span>
                 </div>
 "@
         }
@@ -2147,7 +2754,7 @@ function New-HtmlReport {
             $html += @"
                 <div class="item-row">
                     <span class="name">$hookName</span>
-                    <span class="source">Project hooks folder</span>
+                    <span class="source badge-project">Project</span>
                 </div>
 "@
         }
@@ -2166,6 +2773,10 @@ function New-HtmlReport {
             <!-- Permissions Section -->
             <div id="permissions" class="section">
                 <h2 class="section-title">Tool Permissions <span class="count">($permissionsCount rules)</span></h2>
+                <div class="section-description">
+                    Control which tools Claude can use. <strong>Allow</strong> permits without asking, <strong>Deny</strong> blocks completely, <strong>Ask</strong> prompts for confirmation. Rules cascade from Global &rarr; Project, with later rules overriding.
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/settings#tool-permissions" target="_blank">View Permissions Documentation &rarr;</a>
+                </div>
                 <div class="perm-grid">
                     <div class="perm-col allow">
                         <h4>[ALLOW] ($($permissions.Allow.Count))</h4>
@@ -2222,6 +2833,104 @@ function New-HtmlReport {
                         </ul>
                     </div>
                 </div>
+            </div>
+
+            <!-- Enterprise Section -->
+            <div id="enterprise" class="section">
+                <h2 class="section-title">Enterprise Settings <span class="count">($managedCount/3 configured)</span></h2>
+                <div class="section-description">
+                    Organization-wide policies managed by IT administrators. Located in <code>C:\ProgramData\ClaudeCode\</code> (Windows). These settings have highest priority and cannot be overridden by users.
+                    <br><a href="https://docs.anthropic.com/en/docs/claude-code/settings#enterprise-settings" target="_blank">View Enterprise Documentation &rarr;</a>
+                </div>
+"@
+
+    if ($managed.Exists) {
+        $html += @"
+                <div class="output-line">
+                    <span class="key">Enterprise Path</span>
+                    <span class="value ok">$(ConvertTo-HtmlEncoded $managed.Path)</span>
+                </div>
+"@
+
+        if ($managed.Settings.Exists) {
+            $settingsJson = if ($managed.Settings.Content) {
+                $managed.Settings.Content | ConvertTo-Json -Depth 10
+            } else { "{}" }
+            $html += @"
+                <div class="output-block">
+                    <div class="output-block-header" onclick="this.parentElement.classList.toggle('open')">
+                        <span>[+] managed-settings.json</span>
+                        <span class="source badge-enterprise">Enterprise</span>
+                    </div>
+                    <div class="output-block-content">
+                        <pre class="json-view">$(ConvertTo-HtmlEncoded $settingsJson)</pre>
+                    </div>
+                </div>
+"@
+        } else {
+            $html += @"
+                <div class="output-line">
+                    <span class="key">managed-settings.json</span>
+                    <span class="value missing">[--] Not configured</span>
+                </div>
+"@
+        }
+
+        if ($managed.Mcp.Exists) {
+            $mcpJson = if ($managed.Mcp.Content) {
+                $managed.Mcp.Content | ConvertTo-Json -Depth 10
+            } else { "{}" }
+            $html += @"
+                <div class="output-block">
+                    <div class="output-block-header" onclick="this.parentElement.classList.toggle('open')">
+                        <span>[+] managed-mcp.json</span>
+                        <span class="source badge-enterprise">Enterprise</span>
+                    </div>
+                    <div class="output-block-content">
+                        <pre class="json-view">$(ConvertTo-HtmlEncoded $mcpJson)</pre>
+                    </div>
+                </div>
+"@
+        } else {
+            $html += @"
+                <div class="output-line">
+                    <span class="key">managed-mcp.json</span>
+                    <span class="value missing">[--] Not configured</span>
+                </div>
+"@
+        }
+
+        if ($managed.Memory.Exists) {
+            $memoryContent = if ($managed.Memory.Content) { $managed.Memory.Content } else { "" }
+            $html += @"
+                <div class="output-block">
+                    <div class="output-block-header" onclick="this.parentElement.classList.toggle('open')">
+                        <span>[+] CLAUDE.md</span>
+                        <span class="source badge-enterprise">Enterprise</span>
+                    </div>
+                    <div class="output-block-content">
+                        <pre>$(ConvertTo-HtmlEncoded $memoryContent)</pre>
+                    </div>
+                </div>
+"@
+        } else {
+            $html += @"
+                <div class="output-line">
+                    <span class="key">CLAUDE.md</span>
+                    <span class="value missing">[--] Not configured</span>
+                </div>
+"@
+        }
+    } else {
+        $html += @"
+                <div class="empty-state">
+                    <div>No enterprise settings detected</div>
+                    <div class="prompt">Enterprise settings are stored in C:\ProgramData\ClaudeCode\</div>
+                </div>
+"@
+    }
+
+    $html += @"
             </div>
 
             <!-- Tool Usage Section -->
@@ -2285,32 +2994,60 @@ function New-HtmlReport {
 "@
 
     if ($analytics.ModelUsage.Keys.Count -gt 0) {
-        $sortedModels = $analytics.ModelUsage.GetEnumerator() | Sort-Object { $_.Value.Calls } -Descending
-        $maxModelCalls = ($sortedModels | Select-Object -First 1).Value.Calls
-        if ($maxModelCalls -eq 0) { $maxModelCalls = 1 }
+        # Sort by total tokens (input + output)
+        $sortedModels = $analytics.ModelUsage.GetEnumerator() |
+            ForEach-Object { @{ Key = $_.Key; Value = $_.Value; TotalTokens = $_.Value.InputTokens + $_.Value.OutputTokens } } |
+            Sort-Object { $_.TotalTokens } -Descending
+        $maxModelTokens = ($sortedModels | Select-Object -First 1).TotalTokens
+        if ($maxModelTokens -eq 0) { $maxModelTokens = 1 }
 
         $html += @"
                 <div class="chart-container">
-                    <div class="chart-title">Model Usage Distribution</div>
+                    <div class="chart-title">Model Token Distribution</div>
                     <div class="bar-chart">
 "@
         foreach ($model in $sortedModels) {
             $modelName = ConvertTo-HtmlEncoded $model.Key
-            $modelCalls = $model.Value.Calls
-            $widthPct = [Math]::Round(($modelCalls / $maxModelCalls) * 100)
+            $totalTokens = $model.TotalTokens
+            $inputTokens = $model.Value.InputTokens
+            $outputTokens = $model.Value.OutputTokens
+            $widthPct = [Math]::Round(($totalTokens / $maxModelTokens) * 100)
             $barClass = if ($modelName -match "opus") { "yellow" } elseif ($modelName -match "haiku") { "green" } else { "" }
+
+            # Format token display
+            $totalDisplay = if ($totalTokens -ge 1000000) { "{0:N1}M" -f ($totalTokens / 1000000) } elseif ($totalTokens -ge 1000) { "{0:N0}K" -f ($totalTokens / 1000) } else { "$totalTokens" }
+
             $html += @"
                         <div class="bar-row">
                             <span class="bar-label">$modelName</span>
                             <div class="bar-track"><div class="bar-fill $barClass" style="width: ${widthPct}%"></div></div>
-                            <span class="bar-value">$modelCalls calls</span>
+                            <span class="bar-value">$totalDisplay</span>
                         </div>
 "@
         }
         $html += @"
                     </div>
                 </div>
+                <div class="model-tokens-grid">
 "@
+        foreach ($model in $sortedModels) {
+            $modelName = ConvertTo-HtmlEncoded $model.Key
+            $inputTokens = $model.Value.InputTokens
+            $outputTokens = $model.Value.OutputTokens
+            $calls = $model.Value.Calls
+            $inputDisplay = if ($inputTokens -ge 1000000) { "{0:N1}M" -f ($inputTokens / 1000000) } elseif ($inputTokens -ge 1000) { "{0:N0}K" -f ($inputTokens / 1000) } else { "$inputTokens" }
+            $outputDisplay = if ($outputTokens -ge 1000000) { "{0:N1}M" -f ($outputTokens / 1000000) } elseif ($outputTokens -ge 1000) { "{0:N0}K" -f ($outputTokens / 1000) } else { "$outputTokens" }
+
+            $html += @"
+                    <div class="model-token-item">
+                        <span class="model-name" title="$modelName">$modelName</span>
+                        <span class="token-in">In: $inputDisplay</span>
+                        <span class="token-out">Out: $outputDisplay</span>
+                        <span class="token-calls">$calls calls</span>
+                    </div>
+"@
+        }
+        $html += "                </div>`n"
     } else {
         $html += @"
                 <div class="empty-state">
@@ -2517,6 +3254,40 @@ function New-HtmlReport {
     </main>
 
     <script>
+        // JSON Syntax Highlighter
+        function highlightJson(json) {
+            if (typeof json !== 'string') json = JSON.stringify(json, null, 2);
+            json = json.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return json.replace(
+                /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?|[\[\]{}]|,|:)/g,
+                function(match) {
+                    let cls = 'json-number';
+                    if (/^"/.test(match)) {
+                        if (/:$/.test(match)) {
+                            cls = 'json-key';
+                            match = match.slice(0, -1) + '<span class="json-colon">:</span>';
+                        } else {
+                            cls = 'json-string';
+                        }
+                    } else if (/true|false/.test(match)) {
+                        cls = 'json-boolean';
+                    } else if (/null/.test(match)) {
+                        cls = 'json-null';
+                    } else if (/[\[\]{}]/.test(match)) {
+                        cls = 'json-bracket';
+                    } else if (match === ',') {
+                        cls = 'json-comma';
+                    }
+                    return '<span class="' + cls + '">' + match + '</span>';
+                }
+            );
+        }
+
+        // Apply syntax highlighting to all json-view elements
+        document.querySelectorAll('.json-view').forEach(el => {
+            el.innerHTML = highlightJson(el.textContent);
+        });
+
         // Menu navigation
         document.querySelectorAll('.menu-item').forEach(item => {
             item.addEventListener('click', function() {

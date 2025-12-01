@@ -32,8 +32,9 @@ Claude Code Inspector is a PowerShell script that scans and reports on all Claud
 - Main execution block that orchestrates collection and output
 
 **Configuration paths scanned:**
-- Global: `$env:USERPROFILE\.claude\` (settings.json, settings.local.json, CLAUDE.md, agents/, commands/, projects/)
+- Global: `$env:USERPROFILE\.claude\` (settings.json, settings.local.json, CLAUDE.md, agents/, commands/, skills/, projects/)
 - Project: `$ProjectPath\.claude\` and `$ProjectPath\.mcp.json`
+- Enterprise: `C:\ProgramData\ClaudeCode\` (managed-settings.json, managed-mcp.json, CLAUDE.md)
 
 **Session data analyzed:**
 - Token usage: `input_tokens` and `output_tokens` from session `.jsonl` files
@@ -59,12 +60,15 @@ Claude Code Inspector is a PowerShell script that scans and reports on all Claud
 | Section | Description |
 |---------|-------------|
 | Settings | Global and project settings.json files with content preview |
-| MCP Servers | Configured MCP servers from .mcp.json |
-| Memory | CLAUDE.md files (global, project root, .claude folder) |
-| Agents | Custom agent definitions |
+| MCP Servers | Configured MCP servers from .mcp.json and settings |
+| Memory | CLAUDE.md files (global, project root, .claude folder, local) |
+| Agents | Custom agent definitions with YAML frontmatter parsing |
 | Commands | Custom slash commands |
+| Skills | Agent skills (SKILL.md files) with description and allowed tools |
+| Plugins | Configured plugins and marketplace sources |
 | Hooks | Configured hooks from settings |
 | Permissions | Tool permission rules (allow/deny/ask) |
+| Enterprise | Managed settings for enterprise deployments (Windows) |
 
 ### Usage Data
 | Section | Description |
@@ -103,13 +107,17 @@ Claude Code Inspector is a PowerShell script that scans and reports on all Claud
 | `Get-GlobalAnalytics` | Aggregates stats across all projects, finds orphans/stale |
 | `Get-ProjectsInfo` | Scans ~/.claude/projects/, extracts cwd and session stats |
 | `Get-SettingsInfo` | Collects settings.json from all locations |
-| `Get-McpServersInfo` | Parses .mcp.json for MCP server configs |
-| `Get-MemoryInfo` | Finds CLAUDE.md files |
+| `Get-McpServersInfo` | Parses .mcp.json and settings for MCP server configs |
+| `Get-MemoryInfo` | Finds CLAUDE.md files (including CLAUDE.local.md) |
 | `Get-AgentsInfo` | Lists custom agents |
 | `Get-CommandsInfo` | Lists custom commands |
+| `Get-SkillsInfo` | Scans skills directories for SKILL.md files |
+| `Get-PluginsInfo` | Collects plugin configurations and marketplaces |
 | `Get-HooksInfo` | Collects hooks from settings |
 | `Get-ToolPermissions` | Merges permission rules from all settings |
 | `Get-PermissionConflicts` | Detects conflicting rules between settings levels |
+| `Get-ManagedSettingsInfo` | Checks for enterprise managed settings |
+| `Get-YamlFrontmatter` | Parses YAML frontmatter from markdown files |
 | `Get-Recommendations` | Generates setup and cleanup suggestions |
 | `Get-TokenCost` | Calculates API cost from tokens |
 | `Format-FileSize` | Formats bytes as KB/MB/GB |
@@ -117,9 +125,9 @@ Claude Code Inspector is a PowerShell script that scans and reports on all Claud
 
 ## Cost Estimation
 
-Uses predefined rates per 1M tokens:
-- Claude 3 Opus / Claude Opus 4: $15 input, $75 output
-- Claude 3 Sonnet / Claude Sonnet 4: $3 input, $15 output
+Uses predefined rates per 1M tokens (2025 pricing):
+- Claude 3 Opus / Claude Opus 4 / Claude Opus 4.5: $15 input, $75 output
+- Claude 3 Sonnet / Claude Sonnet 4 / Claude Sonnet 4.5: $3 input, $15 output
 - Claude 3.5 Sonnet: $3 input, $15 output
 - Claude 3 Haiku: $0.25 input, $1.25 output
 - Claude 3.5 Haiku: $0.80 input, $4 output
